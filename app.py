@@ -5,6 +5,7 @@ import pickle
 import warnings
 from pathlib import Path
 from datetime import datetime, timedelta
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,7 @@ warnings.filterwarnings("ignore")
 # For deployment, assume models/data are relative to app.py
 DRIVE_ROOT     = "." # Assumes nse_predictor2 content is in the same dir as app.py
 CHECKPOINT_DIR = f"{DRIVE_ROOT}/nse_predictor2/checkpoints/universal"
+ADAPTER_DIR    = f"{DRIVE_ROOT}/nse_predictor2/checkpoints/adapters" # New: for hybrid model
 DATA_CACHE_DIR = f"{DRIVE_ROOT}/nse_predictor2/data_cache"
 
 # Model Hyperparameters (must match trained model)
@@ -38,6 +40,7 @@ N_HEADS        = 4
 N_LAYERS       = 3
 DROPOUT        = 0.1
 GRAD_CLIP      = 1.0
+ADAPTER_RANK   = 8 # New: for hybrid model adapter bottleneck dimension
 
 # Feature columns (must match training)
 FEATURE_COLS = [
@@ -57,6 +60,19 @@ TARGET_COLS = ["log_ret_1"]
 
 # Make StockScaler available in __main__ for pickle compatibility
 import __main__
+
+# --- Custom Unpickler for handling __main__ class references ---
+class CustomUnpickler(pickle.Unpickler):
+    """Handle unpickling when classes were saved in a different __main__ context."""
+    def find_class(self, module, name):
+        if module == '__main__' and name == 'StockScaler':
+            return StockScaler
+        if module == '__main__' and name == 'UniversalStockTransformer':
+            return UniversalStockTransformer
+        if module == '__main__' and name == 'StockPredictorLit':
+            return StockPredictorLit
+        return super().find_class(module, name)
+
 
 # --- StockScaler Class (from universal_model.py) ---
 class StockScaler:
@@ -204,11 +220,22 @@ class UniversalStockTransformer(nn.Module):
         se = self.stock_emb(stock_ids).unsqueeze(1)
         h  = h + se.expand(-1, T, -1)
         h = self.pos_enc(h)
-        mask = self.causal_mask[:T, :T] if T < self.seq_len else self.causal_mask
+        mask = self.causal_mask[:T, :T] # if T < self.seq_len else self.causal_mask # Mask shape needs to adapt to current T
+        # Dynamically adjust mask size if needed
+        if T < self.causal_mask.shape[0]:
+            mask = self.causal_mask[:T, :T]
+        else:
+            # If T is larger or equal, we might need a new mask or assume it's pre-computed for max_len
+            # For this context, assuming T <= max_len that causal_mask is built for.
+            # If T > self.causal_mask.shape[0], this would raise an error, but unlikely given PositionalEncoding max_len.
+            mask = self.causal_mask
+
         h = self.encoder(h, mask=mask)
         last = h[:, -1, :]
         out = self.head(last)
         return out.view(B, self.pred_len)
+
+__main__.UniversalStockTransformer = UniversalStockTransformer # Register for pickle
 
 
 # --- Lightning Module (from universal_model.py) ---
@@ -237,51 +264,199 @@ class StockPredictorLit(pl.LightningModule):
             opt, T_max=MAX_EPOCHS, eta_min=1e-6)
         return [opt], [{"scheduler": sched, "interval": "epoch"}]
 
+__main__.StockPredictorLit = StockPredictorLit # Register for pickle
+
+
+# --- Hybrid Model Components (from hybrid_model.py) ---
+def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure single-level column headers regardless of yfinance version."""
+    if isinstance(df.columns, pd.MultiIndex):
+        level0 = df.columns.get_level_values(0)
+        if "Close" in level0:
+            df.columns = level0
+        else:
+            df.columns = df.columns.get_level_values(1)
+    return df
+
+
+class StockAdapter(nn.Module):
+    def __init__(self, base_model: UniversalStockTransformer,
+                 rank: int = ADAPTER_RANK):
+        super().__init__()
+        self.base = base_model
+        self.rank = rank
+
+        # Freeze ALL base parameters
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+        d = self.base.d_model
+
+        # Small bottleneck MLP — only these weights are trained
+        self.adapter_mlp = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, rank),
+            nn.GELU(),
+            nn.Linear(rank, d),
+        )
+
+        # Stock-specific output head
+        # Output: (B, PRED_LEN)  — flat log returns, same as universal
+        self.head_override = nn.Sequential(
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Dropout(DROPOUT),
+            nn.Linear(d, PRED_LEN),   # — PRED_LEN not PRED_LEN*2
+        )
+
+    def forward(self, x: torch.Tensor, stock_ids: torch.Tensor) -> torch.Tensor:
+        """
+        x:         (B, SEQ_LEN, n_features)
+        stock_ids: (B,)
+        returns:   (B, PRED_LEN)   — flat log return predictions
+        """
+        B, T, _ = x.shape
+
+        # -- Base encoder forward (identical to universal) --
+        h = self.base.input_proj(x)                        # (B, T, D)
+        se = self.base.stock_emb(stock_ids).unsqueeze(1)   # (B, 1, D)
+        h = h + se.expand(-1, T, -1)
+        h = self.base.pos_enc(h)
+
+        # Causal mask — must match universal's registered buffer
+        mask = self.base.causal_mask[:T, :T] # if T < self.base.seq_len else self.base.causal_mask
+        # Dynamically adjust mask size if needed
+        if T < self.base.causal_mask.shape[0]:
+            mask = self.base.causal_mask[:T, :T]
+        else:
+            mask = self.base.causal_mask
+
+        h = self.base.encoder(h, mask=mask)                # (B, T, D)
+
+        last = h[:, -1, :]                                 # (B, D)
+
+        # -- Adapter residual + stock-specific head --
+        last = last + self.adapter_mlp(last)               # residual
+        return self.head_override(last)                    # (B, PRED_LEN)
+
+    def trainable_params(self):
+        return [p for p in self.parameters() if p.requires_grad]
+
+    def n_trainable(self):
+        return sum(p.numel() for p in self.trainable_params())
+
+
+def _load_base_model(base_ckpt_path: str, n_features: int,
+                     n_stocks: int) -> UniversalStockTransformer:
+    """
+    Load base model from checkpoint. Handles two formats:
+      1. PyTorch Lightning .ckpt  (produced by Trainer during main training)
+      2. Plain torch.save dict with 'model_state_dict' key
+         (produced by incremental_update in universal_model.py)
+    Freezes all weights after loading.
+    """
+    model = UniversalStockTransformer(
+        n_features=n_features, n_stocks=n_stocks,
+        d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
+        dropout=DROPOUT, seq_len=SEQ_LEN, pred_len=PRED_LEN,
+    )
+
+    raw = torch.load(base_ckpt_path, map_location="cpu")
+
+    if "model_state_dict" in raw:
+        # Format written by incremental_update: plain state dict
+        model.load_state_dict(raw["model_state_dict"])
+    else:
+        # Format written by pl.Trainer ModelCheckpoint: Lightning ckpt
+        # Need to instantiate the Lit module with the correct model class
+        lit = StockPredictorLit.load_from_checkpoint(
+            base_ckpt_path, model=model)
+        model = lit.model
+
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
 
 # --- Prediction Function (from universal_model.py) ---
 @st.cache_resource
 def load_model_resources():
-    """Load stock_id_map, scalers, and the trained model."""
+    """Load stock_id_map, scalers, and the trained model (universal and hybrid)."""
     STOCK_ID_MAP_PATH = f"{DRIVE_ROOT}/nse_predictor2/stock_id_map.pkl"
     SCALERS_PATH = f"{DRIVE_ROOT}/nse_predictor2/scalers.pkl"
     CHECKPOINT_PATH = f"{CHECKPOINT_DIR}/last.ckpt"
+    ADAPTER_REGISTRY_PATH = f"{ADAPTER_DIR}/registry.pkl"
 
+    errors = []
     if not os.path.exists(STOCK_ID_MAP_PATH):
-        st.error(f"Error: stock_id_map.pkl not found at {STOCK_ID_MAP_PATH}.")
-        st.stop()
+        errors.append(f"stock_id_map.pkl not found at {STOCK_ID_MAP_PATH}.")
     if not os.path.exists(SCALERS_PATH):
-        st.error(f"Error: scalers.pkl not found at {SCALERS_PATH}.")
-        st.stop()
+        errors.append(f"scalers.pkl not found at {SCALERS_PATH}.")
     if not os.path.exists(CHECKPOINT_PATH):
-        st.error(f"Error: Model checkpoint not found at {CHECKPOINT_PATH}.")
+        errors.append(f"Universal model checkpoint not found at {CHECKPOINT_PATH}.")
+
+    if errors:
+        for err in errors: st.error(err)
         st.stop()
 
     with open(STOCK_ID_MAP_PATH, "rb") as f:
         stock_id_map = pickle.load(f)
     with open(SCALERS_PATH, "rb") as f:
-        scalers = pickle.load(f)
+        scalers = CustomUnpickler(f).load() # Use CustomUnpickler
 
-    # Rebuild model from hparams stored in checkpoint
-    # Probe feature count from a dummy run or stored config if available.
-    # For simplicity, we'll assume FEATURE_COLS length for n_features.
-    n_features_val = len(FEATURE_COLS)
+    # Probe feature count from a dummy run or stored config
+    sample_sym = next(iter(stock_id_map.keys()))
+    # Need to load a sample parquet to infer n_features
+    # This part assumes data_cache has at least one parquet file matching a symbol
+    sample_meta_path = f"{DATA_CACHE_DIR}/meta.pkl"
+    if os.path.exists(sample_meta_path):
+        with open(sample_meta_path, "rb") as f:
+            meta = pickle.load(f)
+        if sample_sym in meta:
+            sample_df_path = meta[sample_sym]["path"].replace(DRIVE_ROOT + "/nse_predictor2", f"{DRIVE_ROOT}/nse_predictor2") # Adjust path for deployment
+            if os.path.exists(sample_df_path):
+                sample_df = pd.read_parquet(sample_df_path)
+                n_features_val = len([c for c in FEATURE_COLS if c in sample_df.columns])
+            else:
+                st.warning(f"Could not find sample data at {sample_df_path} for feature count. Falling back to default FEATURE_COLS length.")
+                n_features_val = len(FEATURE_COLS)
+        else:
+            st.warning(f"Sample symbol '{sample_sym}' not in meta data. Falling back to default FEATURE_COLS length.")
+            n_features_val = len(FEATURE_COLS)
+    else:
+        st.warning(f"Meta data not found at {sample_meta_path}. Falling back to default FEATURE_COLS length.")
+        n_features_val = len(FEATURE_COLS)
+
     n_stocks_val   = max(stock_id_map.values()) + 1 if stock_id_map else 0
 
-    model = UniversalStockTransformer(
+    # Load Universal Model for Free Mode
+    universal_model = UniversalStockTransformer(
         n_features=n_features_val, n_stocks=n_stocks_val,
         d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
         dropout=DROPOUT, seq_len=SEQ_LEN, pred_len=PRED_LEN,
     )
-    lit = StockPredictorLit.load_from_checkpoint(CHECKPOINT_PATH, model=model)
-    lit.eval()
+    lit_universal = StockPredictorLit.load_from_checkpoint(CHECKPOINT_PATH, model=universal_model)
+    lit_universal.eval()
 
-    return stock_id_map, scalers, lit
+    # Load Base Model for Hybrid Mode (used by adapters)
+    base_model_hybrid = _load_base_model(CHECKPOINT_PATH, n_features_val, n_stocks_val)
+
+    # Load Adapter Registry for Pro Mode
+    adapter_registry = {}
+    if os.path.exists(ADAPTER_REGISTRY_PATH):
+        with open(ADAPTER_REGISTRY_PATH, "rb") as f:
+            adapter_registry = pickle.load(f)
+    else:
+        st.warning(f"Adapter registry not found at {ADAPTER_REGISTRY_PATH}. Pro mode might not work for all stocks.")
+
+    return stock_id_map, scalers, lit_universal, base_model_hybrid, adapter_registry
 
 
 def predict_next_days_universal(symbol: str, scalers: dict,
                    stock_id_map: dict, lit_model: StockPredictorLit,
                    seq_len: int = SEQ_LEN, pred_len_user: int = PRED_LEN) -> pd.DataFrame | None:
-  """Predicts next `pred_len_user` days' close prices for a given stock."""
+  """Predicts next `pred_len_user` days' close prices for a given stock using the universal model."""
 
   if symbol not in scalers or symbol not in stock_id_map:
       st.error(f"Stock '{symbol}' not found in model resources. Please select another.")
@@ -355,19 +530,153 @@ def predict_next_days_universal(symbol: str, scalers: dict,
   return result
 
 
+def hybrid_predict(
+symbol: str,
+                   base_model: UniversalStockTransformer,
+                   adapter_dir: str,
+                   scalers: dict,
+                   stock_id_map: dict,
+                   pred_len: int = PRED_LEN,
+                   confidence: bool = True,
+                   n_mc: int = 30) -> pd.DataFrame | None:
+    """
+    Pro-tier inference: base model + stock adapter + optional MC-Dropout CI.
+
+    Returns DataFrame with:
+        Predicted_Close                       (always)
+        Close_Low_90, Close_High_90           (if confidence=True)
+    Prices are in original INR scale.
+    """
+    adapter_path = f"{adapter_dir}/{symbol.replace('.', '_')}.pt"
+    if not os.path.exists(adapter_path):
+        st.warning(f"[HYBRID] No adapter for {symbol}. Please train it first.")
+        return None
+
+    if symbol not in scalers or symbol not in stock_id_map:
+        st.error(f"[HYBRID] {symbol} missing from scalers/stock_id_map.")
+        return None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # -- Fetch recent data --
+    today = datetime.today()
+    raw = yf.download(
+        symbol,
+        start=(today - timedelta(days=450)).strftime("%Y-%m-%d"),
+        progress=False, auto_adjust=True)
+    raw = _flatten_yf_columns(raw)
+
+    if raw.empty or "Close" not in raw.columns:
+        st.error(f"[HYBRID] No historical data available for {symbol}.")
+        return None
+
+    df = add_features(raw[["Open", "High", "Low", "Close", "Volume"]])
+    feat_cols = [c for c in FEATURE_COLS if c in df.columns]
+    df_norm   = scalers[symbol].transform(df, feat_cols)
+    arr       = df_norm[feat_cols].values.astype(np.float32)
+
+    if len(arr) < SEQ_LEN:
+        st.warning(f"[HYBRID] Insufficient rows for {symbol}: {len(arr)} < {SEQ_LEN}")
+        return None
+
+    window = torch.tensor(arr[-SEQ_LEN:]).unsqueeze(0).to(device)  # (1, SEQ_LEN, F)
+    sid    = torch.tensor([stock_id_map[symbol]], dtype=torch.long).to(device)
+
+    # -- Load base + adapter --
+    adapter = StockAdapter(base_model, rank=ADAPTER_RANK)
+    ckpt    = torch.load(adapter_path, map_location="cpu")
+    adapter.adapter_mlp.load_state_dict(ckpt["adapter_mlp"])
+    adapter.head_override.load_state_dict(ckpt["head_override"])
+    adapter.to(device)
+
+    last_close = float(df["Close"].iloc[-1])
+    scaler_obj = scalers[symbol]   # named to avoid shadowing outer `scalers` dict
+
+    # -- Inverse-transform log returns -> INR prices --
+    def logret_to_prices(pred_np: np.ndarray) -> np.ndarray:
+        """
+        pred_np : (PRED_LEN,) -- raw model output (normalised log return space)
+        Returns : (PRED_LEN,) -- INR close prices, chained from last known close.
+        Matches universal_model.predict_next_days exactly:
+          step 1: un-normalise  ->  log_ret = pred * std + mean
+          step 2: chain prices  ->  price_t = price_{t-1} * exp(log_ret_t)
+        """
+        # Ensure pred_np has at least pred_len elements for processing
+        if len(pred_np) < pred_len:
+             # This case should ideally not happen if model output is consistent
+             # For robustness, we can pad or handle gracefully, e.g., by replicating last value.
+             # For now, let's assume it matches.
+            pass # Or raise an error, or pad
+
+        log_rets = (pred_np[:pred_len] * scaler_obj.stds["log_ret_1"]
+                    + scaler_obj.means["log_ret_1"])
+        prices = np.zeros(pred_len, dtype=np.float32)
+        base   = last_close
+        for j in range(pred_len):
+            base      = base * np.exp(log_rets[j])
+            prices[j] = base
+        return prices
+
+    # -- Inference --
+    if confidence:
+        # MC-Dropout: keep dropout active, freeze BN
+        adapter.train()
+        for m in adapter.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d,
+                               nn.LayerNorm)):
+                m.eval()
+
+        preds_list = []
+        with torch.no_grad():
+            for _ in range(n_mc):
+                p = adapter(window, sid).squeeze(0).cpu().numpy()  # (PRED_LEN,)
+                preds_list.append(logret_to_prices(p))
+
+        preds_arr = np.stack(preds_list, axis=0)     # (n_mc, PRED_LEN)
+        mean_price = preds_arr.mean(axis=0)
+        lo_price   = np.percentile(preds_arr, 5,  axis=0)
+        hi_price   = np.percentile(preds_arr, 95, axis=0)
+
+        last_date = df.index[-1]
+        dates     = pd.bdate_range(start=last_date + timedelta(days=1),
+                                    periods=pred_len)
+        return pd.DataFrame({
+            "Predicted_Close": mean_price,
+            "Close_Low_90":    lo_price,
+            "Close_High_90":   hi_price,
+        }, index=dates)
+
+    else:
+        adapter.eval()
+        with torch.no_grad():
+            pred_norm = adapter(window, sid).squeeze(0).cpu().numpy()
+
+        prices    = logret_to_prices(pred_norm)
+        last_date = df.index[-1]
+        dates     = pd.bdate_range(start=last_date + timedelta(days=1),
+                                    periods=pred_len)
+        return pd.DataFrame({"Predicted_Close": prices}, index=dates)
+
+
 # --- Streamlit UI ---
 st.set_page_config(page_title="Stock Price Predictor", layout="centered")
 
 st.title("📈 NSE Stock Price Predictor")
-st.markdown("Predict future closing prices for Indian stocks using a Universal Transformer Model.")
+st.markdown("Predict future closing prices for Indian stocks using Universal or Hybrid Models.")
 
 # Load resources once and cache them
-stock_id_map, scalers, lit_model = load_model_resources()
+stock_id_map, scalers, lit_universal_model, base_model_hybrid, adapter_registry = load_model_resources()
 
 available_stocks = sorted(stock_id_map.keys())
 
 # Sidebar for user inputs
 st.sidebar.header("Prediction Settings")
+
+prediction_mode = st.sidebar.radio(
+    "Select Prediction Mode",
+    ("Free Mode (Universal Model)", "Pro Mode (Hybrid Model)")
+)
+
 selected_symbol = st.sidebar.selectbox(
     "Select Stock Symbol",
     options=available_stocks,
@@ -381,29 +690,67 @@ num_days_to_predict = st.sidebar.slider(
     value=2
 )
 
-if st.sidebar.button("Get Predictions"): 
+if st.sidebar.button("Get Predictions"):
     if selected_symbol:
-        with st.spinner(f"Fetching data and predicting for {selected_symbol}..."):
-            predictions_df = predict_next_days_universal(
-                symbol=selected_symbol,
-                scalers=scalers,
-                stock_id_map=stock_id_map,
-                lit_model=lit_model,
-                pred_len_user=num_days_to_predict
-            )
-            if predictions_df is not None:
-                st.subheader(f"Predictions for {selected_symbol} for next {num_days_to_predict} day(s)")
-                st.dataframe(predictions_df.style.format(formatter={'Predicted_Close': "₹ {:,.2f}"}))
+        predictions_df = None
+        with st.spinner(f"Fetching data and predicting for {selected_symbol} in {prediction_mode}..."):
+            if prediction_mode == "Free Mode (Universal Model)":
+                predictions_df = predict_next_days_universal(
+                    symbol=selected_symbol,
+                    scalers=scalers,
+                    stock_id_map=stock_id_map,
+                    lit_model=lit_universal_model,
+                    pred_len_user=num_days_to_predict
+                )
+            elif prediction_mode == "Pro Mode (Hybrid Model)":
+                if selected_symbol not in adapter_registry or adapter_registry[selected_symbol] is None:
+                    st.warning(f"Hybrid adapter not found for {selected_symbol}. Please train it first for Pro Mode. Falling back to Free Mode.")
+                    # Fallback to universal if adapter not found
+                    predictions_df = predict_next_days_universal(
+                        symbol=selected_symbol,
+                        scalers=scalers,
+                        stock_id_map=stock_id_map,
+                        lit_model=lit_universal_model,
+                        pred_len_user=num_days_to_predict
+                    )
+                    st.info("Displayed predictions are from Free Mode (Universal Model).")
+                else:
+                    predictions_df = hybrid_predict(
+                        symbol=selected_symbol,
+                        base_model=base_model_hybrid,
+                        adapter_dir=ADAPTER_DIR,
+                        scalers=scalers,
+                        stock_id_map=stock_id_map,
+                        pred_len=num_days_to_predict,
+                        confidence=True # Enable confidence intervals for pro mode
+                    )
 
-                # Simple plot of predictions
-                st.line_chart(predictions_df['Predicted_Close'])
+            if predictions_df is not None:
+                st.subheader(f"Predictions for {selected_symbol} for next {num_days_to_predict} day(s) ({prediction_mode})")
+
+                if "Close_Low_90" in predictions_df.columns:
+                    # Display with confidence intervals for Pro Mode
+                    st.dataframe(predictions_df.style.format({
+                        'Predicted_Close': "₹ {:,.2f}",
+                        'Close_Low_90': "₹ {:,.2f}",
+                        'Close_High_90': "₹ {:,.2f}"
+                    }))
+
+                    # Plot with shaded confidence interval
+                    st.line_chart(predictions_df[["Predicted_Close", "Close_Low_90", "Close_High_90"]])
+                else:
+                    # Display for Free Mode
+                    st.dataframe(predictions_df.style.format(formatter={'Predicted_Close': "₹ {:,.2f}"}))
+                    st.line_chart(predictions_df['Predicted_Close'])
+
             else:
                 st.error("Could not generate predictions. Please check logs for details.")
     else:
         st.warning("Please select a stock symbol.")
 
 st.sidebar.markdown("""
---- 
-**Note:** This demo uses a universal model. 
-Ensure `nse_predictor2` directory with models and data is present for deployment.
+---
+**Note:** This app supports both Universal (Free) and Hybrid (Pro) models.
+
+For deployment, ensure the `nse_predictor2` directory (containing checkpoints, data cache, `stock_id_map.pkl`, `scalers.pkl`, and `adapters` directory) is correctly set up relative to `app.py`.
 """)
