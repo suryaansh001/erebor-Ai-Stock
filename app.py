@@ -414,9 +414,22 @@ def load_model_resources():
         with open(sample_meta_path, "rb") as f:
             meta = pickle.load(f)
         if sample_sym in meta:
-            sample_df_path = meta[sample_sym]["path"].replace(DRIVE_ROOT + "/nse_predictor2", f"{DRIVE_ROOT}/nse_predictor2") # Adjust path for deployment
-            if os.path.exists(sample_df_path):
-                sample_df = pd.read_parquet(sample_df_path)
+            sample_df_path = meta[sample_sym]["path"]
+            # Try several likely locations: original path, adjusted Drive->local path,
+            # and a local data_cache file with the same basename.
+            possible_paths = [
+                sample_df_path,
+                sample_df_path.replace("/content/drive/MyDrive/nse_predictor2", f"{DRIVE_ROOT}/nse_predictor2"),
+                os.path.join(DRIVE_ROOT, "nse_predictor2", "data_cache", os.path.basename(sample_df_path)),
+            ]
+            found_path = None
+            for p in possible_paths:
+                if os.path.exists(p):
+                    found_path = p
+                    break
+
+            if found_path:
+                sample_df = pd.read_parquet(found_path)
                 n_features_val = len([c for c in FEATURE_COLS if c in sample_df.columns])
             else:
                 st.warning(f"Could not find sample data at {sample_df_path} for feature count. Falling back to default FEATURE_COLS length.")
